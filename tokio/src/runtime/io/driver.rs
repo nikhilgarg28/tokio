@@ -11,6 +11,7 @@ cfg_io_uring! {
 use crate::io::interest::Interest;
 use crate::io::ready::Ready;
 use crate::loom::sync::atomic::AtomicUsize;
+use std::sync::atomic::AtomicBool;
 use crate::loom::sync::Mutex;
 use crate::runtime::driver;
 use crate::runtime::io::registration_set;
@@ -53,10 +54,18 @@ pub(crate) struct Handle {
 
     /// Number of I/O event sources registered with the OS poller (via
     /// `add_source`, `register_signal_receiver`, or `add_uring_source`).
-    /// Does not include the internal waker. When this is zero AND the poll
-    /// is non-blocking (timeout = 0), `turn()` can skip the `mio::Poll::poll()`
-    /// syscall entirely since no user-visible events can be produced.
+    /// Does not include the internal waker or signal receiver. When this is
+    /// zero AND the poll is non-blocking (timeout = 0), `turn()` can
+    /// potentially skip the `mio::Poll::poll()` syscall.
     io_event_sources: AtomicUsize,
+
+    /// Set to true when `unpark()` writes to the mio waker. Must be cleared
+    /// by consuming the waker event via `poll()`. This prevents skipping
+    /// a non-blocking poll when there's an un-consumed waker event in the OS
+    /// poller, which would cause subsequent blocking polls to return
+    /// immediately (spin-loop).
+    #[cfg(not(target_os = "wasi"))]
+    pending_wakeup: AtomicBool,
 
     pub(crate) metrics: IoDriverMetrics,
 
@@ -144,6 +153,8 @@ impl Driver {
             #[cfg(not(target_os = "wasi"))]
             waker,
             io_event_sources: AtomicUsize::new(0),
+            #[cfg(not(target_os = "wasi"))]
+            pending_wakeup: AtomicBool::new(false),
             metrics: IoDriverMetrics::default(),
             #[cfg(all(
                 tokio_unstable,
@@ -191,13 +202,22 @@ impl Driver {
 
         handle.release_pending_registrations();
 
-        // When no I/O event sources are registered (fd_count == 0) and this is
-        // a non-blocking poll (timeout = 0), skip the mio::Poll::poll() syscall
-        // entirely. The only source registered with mio in this case is the
-        // internal waker, which cannot produce user-visible I/O events. This
-        // avoids an unnecessary epoll_wait/kevent/io_uring_enter syscall per
-        // call, which is significant for runtimes that yield frequently (e.g.,
-        // cooperative schedulers embedded in a tokio current-thread runtime).
+        // When no I/O event sources are registered (fd_count == 0), this is
+        // a non-blocking poll (timeout = 0), and there's no pending waker event
+        // to consume, skip the mio::Poll::poll() syscall entirely. This avoids
+        // an unnecessary epoll_wait/kevent syscall per call, which is significant
+        // for runtimes that yield frequently (e.g., cooperative schedulers
+        // embedded in a tokio current-thread runtime).
+        //
+        // We must still poll if pending_wakeup is true, because the waker event
+        // needs to be consumed from the OS poller — otherwise the next blocking
+        // poll would return immediately, causing a spin-loop.
+        #[cfg(not(target_os = "wasi"))]
+        let should_poll = max_wait != Some(Duration::ZERO)
+            || handle.io_event_sources.load(Ordering::Relaxed) > 0
+            || handle.pending_wakeup.swap(false, Ordering::Acquire);
+
+        #[cfg(target_os = "wasi")]
         let should_poll = max_wait != Some(Duration::ZERO)
             || handle.io_event_sources.load(Ordering::Relaxed) > 0;
 
@@ -280,7 +300,10 @@ impl Handle {
     /// return immediately.
     pub(crate) fn unpark(&self) {
         #[cfg(not(target_os = "wasi"))]
-        self.waker.wake().expect("failed to wake I/O driver");
+        {
+            self.pending_wakeup.store(true, Ordering::Release);
+            self.waker.wake().expect("failed to wake I/O driver");
+        }
     }
 
     /// Registers an I/O resource with the reactor for a given `mio::Ready` state.
